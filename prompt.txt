@@ -1,0 +1,115 @@
+You are GitHub Copilot inside VS Code. Create a complete, runnable **no-hardware** AI/ML demo called **spectrum-optimizer** that simulates crowded radio spectrum, predicts next-step free channels, and allocates users to channels to maximize throughput and reduce collisions. Generate all files with full content so `streamlit run app.py` works immediately.
+
+## Tech & Constraints
+- Python 3.10+
+- Streamlit (UI), NumPy, pandas, scikit-learn, matplotlib (no seaborn)
+- No external data or radios: **simulate everything**.
+- Code must be clean, commented, and fast (sub-50ms decision step typical).
+
+## Project Layout (create these files)
+- app.py                      # Streamlit dashboard (entrypoint)
+- src/simulate.py             # spectrum + demand simulators
+- src/features.py             # lag/rolling features for per-channel forecasting
+- src/forecast.py             # per-channel LogisticRegression training + predict_p_free
+- src/allocate.py             # greedy, random, round-robin allocators
+- src/metrics.py              # throughput, collisions, attempts, Jain’s fairness
+- src/run_loop.py             # main loop to compare methods
+- data/samples/sample_run.npz # tiny saved O,D for instant demo (generate it)
+- requirements.txt
+- README.md
+
+## Functional Spec
+
+### 1) Simulator (src/simulate.py)
+Implement:
+- `simulate_occupancy(T=600, M=8, seed=42) -> np.ndarray[int] shape (T,M)`
+  - For each channel c, generate O[t,c]∈{0,1} (1=busy):
+    - base busy prob p0[c] in [0.2,0.6]
+    - persistence alpha[c] in [0.7,0.95] (Markov)
+    - seasonality term (sinusoid over 60-step period)
+    - occasional burst noise
+    - clip probabilities to [0.05, 0.95]
+- `simulate_demand(T=600, N=12, seed=123) -> np.ndarray[float] shape (T,N) in [0,1]`
+  - base demand 0.3–0.6 with short spikes per user
+
+Also add a helper script section to generate and save a sample `(O,D)` to `data/samples/sample_run.npz`.
+
+### 2) Features (src/features.py)
+- `build_channel_dataset(O, w=10)` returns list of `(X_c, y_c)` per channel:
+  - Features at time t per channel c:
+    - lag vector of length w: O[t,c], O[t-1,c], … (most recent first)
+    - rolling means r5 and r15
+    - time-of-minute feature in [0,1] using (t % 60)/60
+  - Label y = 1 if channel will be FREE at next step: y = 1 - O[t+1,c]
+  - Ignore the initial w steps when building rows.
+
+### 3) Forecasting (src/forecast.py)
+- `train_per_channel_models(channel_datasets)`:
+  - Train **LogisticRegression(max_iter=200)** per channel if both classes appear; otherwise store `None` to indicate heuristic fallback.
+- `predict_p_free(models, O, w=10) -> p_free (T,M) float in [0,1]`:
+  - For each t≥w, produce P(free at t) using the same features as training.
+  - If model is None, fallback to heuristic: `p = 1 - recent_r5`.
+
+### 4) Allocation (src/allocate.py)
+- `greedy_allocator(D_t, p_free_t) -> assignment (N,)`:
+  - Sort users by demand desc; each user takes the untaken channel c maximizing `D_t[u]*p_free_t[c]`. One user per channel; users left over get -1.
+- `random_allocator(D_t, p_free_t, rng)`
+- `round_robin_allocator(D_t, p_free_t, rr_ptr) -> (assignment, next_rr_ptr)`
+
+### 5) Metrics (src/metrics.py)
+- `step_throughput(assignment, D_t, O_next) -> (throughput, collisions, attempts)`:
+  - A user succeeds iff channel is free at t+1 AND exactly one user was assigned to that channel; else collision.
+- `jain_index(served_by_user: array) -> float`
+- Provide helpers to accumulate totals across time.
+
+### 6) Orchestration (src/run_loop.py)
+- `run_sim(O, D, p_free, seed=7)`:
+  - For t from w..T-2:
+    - D_t = D[t,:], p_t = p_free[t,:], O_next = O[t+1,:]
+    - Compute assignments for: ML Greedy, Random, Round-robin
+    - Score each; accumulate per-user served demand for fairness
+  - Return:
+    - summary dict for each method {throughput, collisions, attempts, fairness, served_by_user}
+    - per-step throughput arrays for plotting
+
+### 7) Streamlit App (app.py)
+- Sidebar controls: T [200–1000, default 600], M [4–16, default 8], N [4–30, default 12], lag window w [5–30, default 10], seed (int). Button: “Run Simulation”.
+- On run:
+  1) If `data/samples/sample_run.npz` exists, optionally load for instant demo; otherwise simulate fresh O,D.
+  2) Show **True Occupancy** heatmap (matplotlib imshow).
+  3) Build features, train models, compute **Predicted Free Probability** heatmap.
+  4) Run `run_sim(...)` and display:
+     - KPI cards: Total Throughput (ML Greedy), Collisions (ML Greedy), Fairness (Jain’s index)
+     - “Throughput lift vs best baseline (%)” where baseline is max(Random, Round-robin)
+     - Line plot: throughput per step for ML Greedy vs Random vs Round-robin
+     - Table: per-user served demand for the three methods (rounded 3 decimals)
+- Use matplotlib (no seaborn). Keep plots responsive. Add brief captions.
+
+### 8) README.md (write full content)
+Include:
+- Short problem intro in layman + technical one-liner
+- No-hardware claim; synthetic simulator overview
+- Install (Windows PowerShell + macOS/Linux variants)
+  - `python -m venv .venv && . .venv/Scripts/Activate.ps1` (Windows)
+  - `python -m venv .venv && source .venv/bin/activate` (macOS/Linux)
+  - `pip install -r requirements.txt`
+- Run: `streamlit run app.py`
+- What charts show (occupancy vs predicted free prob; throughput; fairness)
+- Metrics definitions (throughput, collisions, Jain’s index)
+- Baselines (Random, Round-robin) and how ML beats them
+- Stretch ideas: Hungarian allocator, contextual bandit, DQN variant
+
+### 9) requirements.txt
+- streamlit
+- numpy
+- pandas
+- scikit-learn
+- matplotlib
+
+## Acceptance Criteria
+- Fresh clone + `pip install -r requirements.txt` + `streamlit run app.py` works with defaults in <5 seconds to first render on a typical laptop.
+- ML Greedy achieves higher total throughput and fewer collisions than Random/Round-robin on most seeds; fairness reported.
+- Robust to degenerate channels (almost always busy/free) via heuristic fallback.
+- Code is well-structured, commented, and matches the layout above.
+
+Generate all files now with full implementations and a small saved sample in `data/samples/`.
